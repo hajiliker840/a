@@ -1,0 +1,44 @@
+name: General Executor
+
+on:
+  repository_dispatch:
+    types: [generate-flux, generate-flux2, generate-cartoon, generate-midjourney, chat-gemma, generate-editor, generate-video, generate-audio]
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  execute:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Base Dependencies
+        run: |
+          pip install gradio_client requests pillow httpx
+
+      - name: Run Dynamic Script
+        env:
+          PYTHON_SCRIPT: ${{ github.event.client_payload.data.script || github.event.client_payload.script }}
+          PROMPT: ${{ github.event.client_payload.data.prompt || github.event.client_payload.prompt }}
+          WIDTH: ${{ github.event.client_payload.data.width || github.event.client_payload.width }}
+          HEIGHT: ${{ github.event.client_payload.data.height || github.event.client_payload.height }}
+          STEPS: ${{ github.event.client_payload.data.steps || github.event.client_payload.steps }}
+          GUIDANCE: ${{ github.event.client_payload.data.guidance || github.event.client_payload.guidance }}
+          SEED: ${{ github.event.client_payload.data.seed || github.event.client_payload.seed }}
+          RANDOMIZE_SEED: ${{ github.event.client_payload.data.randomize_seed || github.event.client_payload.randomize_seed }}
+          PROMPT_UPSAMPLING: ${{ github.event.client_payload.data.prompt_upsampling || github.event.client_payload.prompt_upsampling }}
+          RUN_ID: ${{ github.event.client_payload.data.run_id || github.event.client_payload.run_id }}
+          SPACE_URL: ${{ github.event.client_payload.data.space_url || github.event.client_payload.space_url }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          HF_TOKEN: ${{ github.event.client_payload.data.hf_token || github.event.client_payload.hf_token }}
+          FILE_URL: ${{ github.event.client_payload.data.file_url || github.event.client_payload.file_url }}
+          IMAGE_URLS: ${{ toJson(github.event.client_payload.data.image_urls) || toJson(github.event.client_payload.image_urls) }}
+          IMAGE_URL: ${{ github.event.client_payload.data.image_url || github.event.client_payload.image_url }}
+          DURATION: ${{ github.event.client_payload.data.duration || github.event.client_payload.duration }}
+        run: |
+          echo "$PYTHON_SCRIPT" > run.py
+          python run.py
