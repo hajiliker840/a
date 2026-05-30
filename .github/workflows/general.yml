@@ -2,7 +2,7 @@ name: General Executor
 
 on:
   repository_dispatch:
-    types: [generate-flux, generate-flux2, generate-cartoon, generate-midjourney, chat-gemma, generate-editor, generate-video, generate-audio]
+    types: [generate-flux, generate-flux2, generate-cartoon, generate-midjourney, chat-gemma, generate-editor, generate-video, generate-audio, matnbesada, avatar, ghibli, tarahi-khoneh, gostaresh-tasvir, shabihsazi-sada, face-swap]
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
