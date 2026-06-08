@@ -1,0 +1,276 @@
+name: Persistent Worker
+
+on:
+  repository_dispatch:
+    types: [start-worker]
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  execute:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create Temp Requirements for Caching
+        run: |
+          echo -e "gradio_client\nrequests[socks]\npillow\nhttpx[socks]\npysocks\nsocksio" > temp_requirements.txt
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+          cache-dependency-path: temp_requirements.txt
+
+      - name: Install Base Dependencies
+        run: |
+          pip install -r temp_requirements.txt
+
+      - name: Cache WARP Docker Image
+        id: cache-warp
+        uses: actions/cache@v4
+        with:
+          path: ~/warp-image.tar
+          key: ${{ runner.os }}-warp-image-v1
+
+      - name: Load WARP Docker Image from Cache
+        if: steps.cache-warp.outputs.cache-hit == 'true'
+        run: docker load -i ~/warp-image.tar
+
+      - name: Pull and Save WARP Docker Image
+        if: steps.cache-warp.outputs.cache-hit != 'true'
+        run: |
+          docker pull caomingjun/warp
+          docker save -o ~/warp-image.tar caomingjun/warp
+
+      - name: Start 40 Parallel WARP Containers
+        run: |
+          # اجرای سریع ۴۰ کانتینر داکر وارپ (بالاترین ظرفیت امن پردازنده ۲ هسته‌ای گیت‌هاب)
+          for i in {1..40}; do
+            PORT=$((4000 + i))
+            docker run -d --name warp$i --cap-add=NET_ADMIN -p $PORT:1080 caomingjun/warp
+            echo "Started WARP Instance $i on Port $PORT"
+          done
+          
+          # دادن زمان کافی به پردازنده برای ایجاد ۴۰ تونل و ۴۰ ثبت‌نام همزمان در کلودفلر
+          sleep 35
+          
+          # تست پورت‌های اول و دوم جهت تایید نهایی تغییر آی‌پی‌ها
+          curl --socks5-hostname 127.0.0.1:4001 https://ifconfig.me || true
+          curl --socks5-hostname 127.0.0.1:4002 https://ifconfig.me || true
+
+      - name: Run Persistent Worker
+        env:
+          SPACE_URL: ${{ github.event.client_payload.space_url }}
+        run: |
+          cat << 'EOF' > worker.py
+          import os
+          import sys
+          import time
+          import json
+          import socket
+          import requests
+          import subprocess
+          import threading
+          from datetime import datetime
+
+          SPACE_URL = os.environ.get("SPACE_URL")
+          if not SPACE_URL:
+              print("Error: SPACE_URL env var is not set.", flush=True)
+              sys.exit(1)
+
+          print(f"Starting long-running multi-worker with 40 WARPs for Space: {SPACE_URL}", flush=True)
+
+          start_time = time.time()
+          max_run_duration = 5 * 60 * 60  # 5 hours
+          github_run_id = os.environ.get("GITHUB_RUN_ID", "local-worker")
+
+          # ساخت حافظه موقت بلک‌لیست آی‌پی‌های مسدود شده به صورت سراسری و ایمن بین تمام ۴۰ نخ
+          blacklisted_ips = set()
+          blacklist_lock = threading.Lock()
+
+          def check_and_wait_for_warp(socks_port):
+              """صبر کردن برای فعال شدن کامل کانتینر داکر وارپ و اطمینان از تغییر واقعی IP به کلودفلر"""
+              for _ in range(15):
+                  try:
+                      proxies = {
+                          'http': f'socks5h://127.0.0.1:{socks_port}',
+                          'https': f'socks5h://127.0.0.1:{socks_port}'
+                      }
+                      r = requests.get("https://www.cloudflare.com/cdn-cgi/trace", proxies=proxies, timeout=3)
+                      if r.status_code == 200:
+                          lines = r.text.split("\n")
+                          data = {}
+                          for line in lines:
+                              if "=" in line:
+                                  parts = line.strip().split("=", 1)
+                                  if len(parts) == 2:
+                                      data[parts[0]] = parts[1]
+                          # حتماً باید سیستم تونل کلودفلر فعال باشد تا آی‌پی سرور اصلی گیت‌هاب نشت نکند
+                          if data.get("warp") in ["on", "plus"] and data.get("ip"):
+                              return data.get("ip")
+                  except:
+                      pass
+                  time.sleep(1)
+              return None
+
+          def renew_warp_ip(worker_index, socks_port):
+              """حذف فایل ثبت‌نام قبلی و ری‌استارت فوق‌العاده سریع کانتینر جهت دریافت آی‌پی کاملاً تازه بدون سربار سنگین داکر"""
+              try:
+                  # ۱. پاک کردن فایل ثبت‌نام فیزیکی درون کانتینر تا اسکریپت ورودی داکر مجبور به دریافت هویت جدید شود
+                  subprocess.run(f"docker exec warp{worker_index} rm -f /var/lib/cloudflare-warp/reg.json", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                  time.sleep(0.2)
+                  
+                  # ۲. ری‌استارت بسیار سریع و بدون سربار کانتینر موجود
+                  subprocess.run(f"docker restart warp{worker_index}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                  
+                  current_ip = check_and_wait_for_warp(socks_port)
+                  if current_ip:
+                      print(f"🔄 [Worker {worker_index}] Cloudflare WARP IP rotated successfully. New IP: {current_ip}", flush=True)
+                      return current_ip
+              except Exception as e:
+                  print(f"⚠️ [Worker {worker_index}] Error renewing WARP IP: {e}", flush=True)
+              return None
+
+          def run_worker_thread(worker_index, socks_port):
+              print(f"[{worker_index}] Worker thread started using SOCKS {socks_port}", flush=True)
+              thread_worker_id = f"{github_run_id}_w{worker_index}"
+              
+              while time.time() - start_time < max_run_duration:
+                  try:
+                      # ارسال ضربان قلب مجهز به شناسه منحصربه‌فرد این نخ کارگر موازی
+                      try:
+                          requests.post(f"{SPACE_URL}/api/worker/heartbeat", json={"worker_id": thread_worker_id}, timeout=10)
+                      except Exception as e:
+                          pass
+
+                      # ۱. بررسی زنده بودن و عدم بلک‌لیست بودن آی‌پی فعلی قبل از هرگونه دریافت تسک جدید
+                      current_ip = check_and_wait_for_warp(socks_port)
+                      
+                      with blacklist_lock:
+                          is_blacklisted = current_ip in blacklisted_ips if current_ip else True
+
+                      if not current_ip or is_blacklisted:
+                          if is_blacklisted and current_ip:
+                              print(f"[{worker_index}] ⚠️ Current IP {current_ip} is blacklisted. Rotating in background...", flush=True)
+                          else:
+                              print(f"[{worker_index}] ⚠️ WARP offline. Initializing/reconnecting in background...", flush=True)
+                          renew_warp_ip(worker_index, socks_port)
+                          time.sleep(2)
+                          continue
+
+                      # ۲. اگر آی‌پی کاملاً سالم و آماده بود، اقدام به نظرسنجی مجهز به شناسه برای ثبت توزیع چرخشی می‌کنیم
+                      r = requests.post(f"{SPACE_URL}/api/worker/poll", json={"worker_id": thread_worker_id}, timeout=15)
+                      if r.status_code == 200:
+                          data = r.json()
+                          if data.get("status") == "success":
+                              run_id = data.get("run_id")
+                              event_type = data.get("event_type")
+                              client_payload = data.get("status") if 'client_payload' not in data else data.get("client_payload", {})
+                              
+                              if not client_payload or client_payload == "success":
+                                  client_payload = data.get("client_payload", {})
+
+                              print(f"[{run_id}] Thread {worker_index} grabbed job ({event_type}) using clean IP: {current_ip}", flush=True)
+                              
+                              # تنظیمات محیطی استاندارد کارگر
+                              job_env = os.environ.copy()
+                              job_env["HTTP_PROXY"] = f"socks5h://127.0.0.1:{socks_port}"
+                              job_env["HTTPS_PROXY"] = f"socks5h://127.0.0.1:{socks_port}"
+                              
+                              # Map client_payload to environment variables
+                              for key, val in client_payload.items():
+                                  if key != "data":
+                                      job_env[key.upper()] = str(val)
+                              
+                              payload_data = client_payload.get("data", {})
+                              if isinstance(payload_data, dict):
+                                  for key, val in payload_data.items():
+                                      if key == "image_urls":
+                                          job_env["IMAGE_URLS"] = json.dumps(val)
+                                      else:
+                                          job_env[key.upper()] = str(val)
+                          
+                              # Extract the script
+                              script_content = payload_data.get("script") or client_payload.get("script")
+                              if not script_content:
+                                  print(f"Error: No script found in payload for job {run_id}", flush=True)
+                                  continue
+                                  
+                              # ایجاد فایل اسکریپت منحصربه‌فرد برای این کارگر جهت عدم تداخل با بقیه نخ‌ها
+                              script_file = f"run_job_{run_id}_w{worker_index}.py"
+                              with open(script_file, "w", encoding="utf-8") as f:
+                                  f.write(script_content)
+                                  
+                              print(f"Executing script for job {run_id} (IP: {current_ip})...", flush=True)
+                              
+                              process = subprocess.Popen(
+                                  [sys.executable, script_file],
+                                  env=job_env,
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT,
+                                  text=True
+                              )
+                              
+                              output_lines = []
+                              for line in process.stdout:
+                                  print(f"[{run_id}] {line.strip()}", flush=True)
+                                  output_lines.append(line)
+                                  
+                              process.wait()
+                              
+                              try:
+                                  os.remove(script_file)
+                              except:
+                                  pass
+
+                              if process.returncode == 0:
+                                  print(f"Job {run_id} finished successfully.", flush=True)
+                              else:
+                                  # بروز خطا (احتمالاً محدودیت سهمیه آی‌پی)
+                                  print(f"[{run_id}] ⚠️ Job failed (Exit Code {process.returncode}). Blacklisting IP {current_ip} and releasing job back to queue...", flush=True)
+                                  
+                                  # افزودن آی‌پی جاری به بلک‌لیست سراسری برای ممانعت از استفاده توسط بقیه نخ‌ها
+                                  if current_ip:
+                                      with blacklist_lock:
+                                          blacklisted_ips.add(current_ip)
+                                  
+                                  # آزادسازی فوری تسک جهت دریافت توسط نخ‌های آماده و تمیز دیگر
+                                  try:
+                                      requests.post(
+                                          f"{SPACE_URL}/api/webhook/fail",
+                                          json={
+                                              "run_id": run_id,
+                                              "error": f"IP rate-limit/quota issue on {current_ip}. Released for Hot-Swap retry.",
+                                              "github_run_id": os.environ.get("GITHUB_RUN_ID", "")
+                                          },
+                                          timeout=15
+                                      )
+                                  except Exception as ex:
+                                      print(f"Error releasing job back to server: {ex}", flush=True)
+                                      
+                                  # چرخاندن آی‌پی این نخ در پس‌زمینه به صورت غیرهمزمان تا دوباره تمیز و گرم شود
+                                  renew_warp_ip(worker_index, socks_port)
+                                  
+                              continue
+                  except Exception as e:
+                      print(f"[{worker_index}] Error in thread loop: {e}", flush=True)
+                      
+                  time.sleep(2)
+
+          # راه‌اندازی ۴۰ نخ کارگر موازی به همراه اختصاص پورت‌های داکر مجزا
+          threads = []
+          for idx in range(1, 41):
+              port = 4000 + idx
+              t = threading.Thread(target=run_worker_thread, args=(idx, port), daemon=True)
+              t.start()
+              threads.append(t)
+
+          # نگه داشتن نخ اصلی تا زمانی که زمان اجرا به پایان برسد
+          while time.time() - start_time < max_run_duration:
+              time.sleep(10)
+
+          print("All worker threads finished. Exiting.", flush=True)
+          EOF
+          python worker.py
